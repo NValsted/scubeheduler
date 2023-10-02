@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "scubeheduler"
+version = "0.1.0"
+description = ""
+authors = ["Nicolaj Valsted <nicv@itu.dk>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.9,<3.10"
+astropy = "^5.3.3"
+meson = "^1.2.2"
+ninja = "^1.11.1"
+poliastro = "^0.17.0"
+matplotlib = "3.7"
+
+
+[tool.poetry.group.dev.dependencies]
+ipython = "^8.16.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
