@@ -1,12 +1,14 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
+import numpy as np
 from astropy import units as u
 from matplotlib import pyplot as plt
 from poliastro.bodies import Earth
 from poliastro.twobody import Orbit
-from poliastro.util import Time
+from skyfield.api import load
 
-LAUNCH_DATE = Time("2022-07-11 05:05", scale="utc")
+LAUNCH_DATE = datetime(2024, 7, 1, tzinfo=timezone.utc)
 EARTH_MU = (3.986004418 * (10**14)) << (u.m**3 / u.s**2)  # type: ignore
 MEAN_MOTION = 15.09 << 1 / u.day  # type: ignore
 
@@ -16,6 +18,10 @@ INCLINATION = 97.566002 << u.deg  # type: ignore
 RIGHT_ASCENSION = 0.0 << u.deg  # type: ignore
 ARGUMENT_OF_PERIGEE = 0 << u.deg  # type: ignore
 INITIAL_ANOMALY = -90.0 << u.deg  # type: ignore
+
+SOLAR_IRRADIANCE = 1361 << u.W / u.m**2  # type: ignore
+SOLAR_CELL_EFFICIENCY = 0.293 << u.one  # type: ignore
+SOLAR_PANEL_AREA = (10**-4) * 10 * 3 * 4 << u.m**2  # type: ignore
 
 
 @dataclass
@@ -52,7 +58,7 @@ class Satellite:
 
 
 def main():
-    orbit = Orbit.from_classical(
+    sat_orbit = Orbit.from_classical(
         Earth,
         SEMI_MAJOR_AXIS,
         ECCENTRICITY,
@@ -62,10 +68,37 @@ def main():
         INITIAL_ANOMALY,
     )
 
+    eph = load("de421.bsp")
+    earth, sun = eph["earth"], eph["sun"]
+
+    ts = load.timescale()
+
     pos = []
+    power = []
     for i in range(int(60 * 10)):
-        orbit = orbit.propagate(1 << u.minute)  # type: ignore
-        pos.append(orbit.r)
+        crr_datetime = LAUNCH_DATE + timedelta(minutes=i)
+        t = ts.utc(crr_datetime.year, crr_datetime.month, crr_datetime.day)
+        sat_orbit = sat_orbit.propagate(1 << u.minute)  # type: ignore
+        pos.append(sat_orbit.r)
+
+        earth_pos = earth.at(t)  # type: ignore
+        sun_pos = sun.at(t)  # type: ignore
+
+        vector_to_sat = sat_orbit.r
+        vector_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
+
+        angle = np.arccos(
+            np.dot(
+                vector_to_sat / np.linalg.norm(vector_to_sat),
+                vector_to_sun / np.linalg.norm(vector_to_sun),
+            )
+        )
+        power.append(
+            SOLAR_IRRADIANCE
+            * SOLAR_CELL_EFFICIENCY
+            * SOLAR_PANEL_AREA
+            * angle.to_value()
+        )
 
     fig = plt.figure()
     ax = fig.add_subplot(projection="3d")
@@ -82,6 +115,7 @@ def main():
         color="green",
         s=200,
     )
+    # plt.plot([p.to_value() for p in power])
     plt.show()
 
 
