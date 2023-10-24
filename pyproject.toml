@@ -12,6 +12,8 @@ meson = "^1.2.2"
 ninja = "^1.11.1"
 poliastro = "^0.17.0"
 matplotlib = "3.7"
+skyfield = "^1.46"
+tqdm = "^4.66.1"
 
 
 [tool.poetry.group.dev.dependencies]
