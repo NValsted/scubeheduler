@@ -1,0 +1,3 @@
+[submodule "lib/adcs-simulation"]
+	path = lib/adcs-simulation
+	url = https://github.com/gavincmartin/adcs-simulation
