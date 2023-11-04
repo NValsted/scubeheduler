@@ -9,6 +9,8 @@ from poliastro.twobody import Orbit
 from skyfield.api import load
 from tqdm import tqdm
 
+from lib import adcssim
+
 LAUNCH_DATE = datetime(2024, 7, 1, tzinfo=timezone.utc)
 
 EARTH_MU = (3.986004418 * (10**14)) << (u.m**3 / u.s**2)  # type: ignore
@@ -56,19 +58,109 @@ class SolarPanels:
 
 
 class Satellite:
-    pass
+    spacecraft: adcssim.spacecraft.Spacecraft  # type: ignore
+    orbit: Orbit
+
+    def __init__(self, spacecraft: adcssim.spacecraft.Spacecraft, orbit):  # type: ignore
+        self.spacecraft = spacecraft
+        self.orbit = orbit
+
+    def propagate(self, time: u.Quantity) -> None:
+        self.orbit = self.orbit.propagate(time)
+
+    @classmethod
+    def factory(cls):
+        sat_orbit = Orbit.from_classical(
+            Earth,
+            SEMI_MAJOR_AXIS,
+            ECCENTRICITY,
+            INCLINATION,
+            RIGHT_ASCENSION,
+            ARGUMENT_OF_PERIGEE,
+            INITIAL_ANOMALY,
+        )
+        r_0 = np.array(sat_orbit.r.to(u.km))  # type: ignore
+        v_0 = np.array(sat_orbit.v.to(u.km / u.s))  # type: ignore
+        b_x = -adcssim.math_utils.normalize(r_0)  # type: ignore
+        b_y = adcssim.math_utils.normalize(v_0)  # type: ignore
+        b_z = adcssim.math_utils.cross(b_x, b_y)  # type: ignore
+
+        dcm_0_nominal = np.stack([b_x, b_y, b_z])
+        q_0_nominal = adcssim.math_utils.dcm_to_quaternion(  # type: ignore
+            dcm_0_nominal
+        )
+        w_nominal_i = (
+            2
+            * np.pi
+            / sat_orbit.period.to(u.s).to_value()  # type: ignore
+            * adcssim.math_utils.normalize(  # type: ignore
+                adcssim.math_utils.cross(r_0, v_0)  # type: ignore
+            )
+        )
+        w_nominal = np.matmul(dcm_0_nominal, w_nominal_i)
+
+        # provide some initial offset in both the attitude and angular velocity
+        q_0 = adcssim.math_utils.quaternion_multiply(  # type: ignore
+            np.array([0, np.sin(2 * np.pi / 180 / 2), 0, np.cos(2 * np.pi / 180 / 2)]),
+            q_0_nominal,
+        )
+        w_0 = w_nominal + np.array([0.005, 0, 0])
+
+        mass = 5.7 << u.kg  # type: ignore
+        dimensions = [10, 10, 10] << u.cm  # type: ignore
+        moment_of_inertia = (
+            1
+            / 12
+            * mass.to(u.kg).to_value()  # type: ignore
+            * np.diag(
+                [
+                    dimensions[1].to(u.m).to_value() ** 2
+                    + dimensions[2].to(u.m).to_value() ** 2,
+                    dimensions[0].to(u.m).to_value() ** 2
+                    + dimensions[2].to(u.m).to_value() ** 2,
+                    dimensions[0].to(u.m).to_value() ** 2
+                    + dimensions[1].to(u.m).to_value() ** 2,
+                ]
+            )
+        )
+
+        controller = adcssim.controller.PDController(  # type: ignore
+            k_d=np.diag([0.01, 0.01, 0.01]), k_p=np.diag([0.1, 0.1, 0.1])
+        )
+
+        gyros = adcssim.sensors.Gyros(  # type: ignore
+            bias_stability=1, angular_random_walk=0.07
+        )
+        magnetometer = adcssim.sensors.Magnetometer(resolution=10e-9)  # type: ignore
+        earth_horizon_sensor = adcssim.sensors.EarthHorizonSensor(  # type: ignore
+            accuracy=0.25
+        )
+
+        actuators = adcssim.actuators.Actuators(  # type: ignore
+            rxwl_mass=226e-3,
+            rxwl_radius=0.5 * 65e-3,
+            rxwl_max_torque=20e-3,
+            rxwl_max_momentum=0.18,
+            noise_factor=0.03,
+        )
+
+        spacecraft = adcssim.spacecraft.Spacecraft(  # type: ignore
+            J=moment_of_inertia,
+            controller=controller,
+            gyros=gyros,
+            magnetometer=magnetometer,
+            earth_horizon_sensor=earth_horizon_sensor,
+            actuators=actuators,
+            q=q_0,
+            w=w_0,
+            r=r_0,
+            v=v_0,
+        )
+        return cls(spacecraft, sat_orbit)
 
 
 def main():
-    sat_orbit = Orbit.from_classical(
-        Earth,
-        SEMI_MAJOR_AXIS,
-        ECCENTRICITY,
-        INCLINATION,
-        RIGHT_ASCENSION,
-        ARGUMENT_OF_PERIGEE,
-        INITIAL_ANOMALY,
-    )
+    satellite: Satellite = Satellite.factory()
 
     eph = load("de421.bsp")
     earth, sun = eph["earth"], eph["sun"]
@@ -80,16 +172,16 @@ def main():
     for i in tqdm(range(int(60 * 10))):
         crr_datetime = LAUNCH_DATE + timedelta(minutes=i)
         t = ts.utc(crr_datetime.year, crr_datetime.month, crr_datetime.day)
-        sat_orbit = sat_orbit.propagate(1 << u.minute)  # type: ignore
-        pos.append(sat_orbit.r)
+        satellite.propagate(1 << u.minute)  # type: ignore
+        pos.append(satellite.orbit.r)
 
         earth_pos = earth.at(t)  # type: ignore
         sun_pos = sun.at(t)  # type: ignore
 
-        v_earth_to_sat = sat_orbit.r
+        v_earth_to_sat = satellite.orbit.r
         v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
         v_sat_to_earth = -v_earth_to_sat
-        v_sat_to_sun = sun_pos.position.to(u.km) - sat_orbit.r
+        v_sat_to_sun = sun_pos.position.to(u.km) - satellite.orbit.r
         sat_direction = v_sat_to_earth  # satellite always pointing towards earth
 
         orbit_sun_angle = np.arccos(
