@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 import numpy as np
 from astropy import units as u
@@ -34,8 +35,6 @@ class ActionResponse:
 
 
 class Scheduler:
-    # sun_vector = None
-
     def __init__(self):
         pass
 
@@ -53,20 +52,96 @@ class Battery:
     pass
 
 
-class SolarPanels:
-    pass
-
-
 class Satellite:
     spacecraft: adcssim.spacecraft.Spacecraft  # type: ignore
     orbit: Orbit
+    time: u.Quantity
+    delta_t: u.Quantity = 1 << u.minute  # type: ignore
+    q_actual: np.ndarray
 
-    def __init__(self, spacecraft: adcssim.spacecraft.Spacecraft, orbit):  # type: ignore
+    nominal_state_func: Callable[
+        [float],
+        tuple[np.ndarray, np.ndarray],
+    ]
+    perturbations_func: Callable[
+        [adcssim.spacecraft.Spacecraft],  # type: ignore
+        np.ndarray,
+    ]
+    position_velocity_func: Callable[
+        [float],
+        tuple[np.ndarray, np.ndarray],
+    ]
+
+    def __init__(
+        self,
+        spacecraft: adcssim.spacecraft.Spacecraft,  # type: ignore
+        orbit: Orbit,
+    ):
         self.spacecraft = spacecraft
         self.orbit = orbit
+        self.time = 0 << u.s
+
+        self.nominal_state_func = self.default_nominal_state_func
+        self.perturbations_func = self.default_perturbations_func
+        self.position_velocity_func = self.default_position_velocity_func
+
+    @staticmethod
+    def default_nominal_state_func(
+        t: float,
+        w_nominal: np.ndarray = np.array([1, 0, 0]),
+        dcm_0_nominal: np.ndarray = np.eye(3),
+    ):
+        if w_nominal[0] != 0:
+            dcm_nominal = np.matmul(
+                adcssim.math_utils.t1_matrix(w_nominal[0] * t),  # type: ignore
+                dcm_0_nominal,
+            )
+        elif w_nominal[1] != 0:
+            dcm_nominal = np.matmul(
+                adcssim.math_utils.t2_matrix(w_nominal[1] * t),  # type: ignore
+                dcm_0_nominal,
+            )
+        elif w_nominal[2] != 0:
+            dcm_nominal = np.matmul(
+                adcssim.math_utils.t3_matrix(w_nominal[2] * t),  # type: ignore
+                dcm_0_nominal,
+            )
+        else:
+            dcm_nominal = dcm_0_nominal
+        return dcm_nominal, w_nominal
+
+    @staticmethod
+    def default_perturbations_func(
+        spacecraft: adcssim.spacecraft.Spacecraft,  # type: ignore
+    ):
+        return (
+            spacecraft.approximate_gravity_gradient_torque()
+            + spacecraft.approximate_magnetic_field_torque()
+        )
+
+    def default_position_velocity_func(self, t: float):
+        orbit_at_t = self.orbit.propagate(
+            t - self.time.to(u.minute).to_value()  # type: ignore
+        )
+        return orbit_at_t.r.to(u.km).to_value(), orbit_at_t.v.to(u.km / u.s).to_value()
 
     def propagate(self, time: u.Quantity) -> None:
-        self.orbit = self.orbit.propagate(time)
+        assert time >= self.delta_t
+        result = adcssim.simulation.simulate_adcs(  # type: ignore
+            satellite=self.spacecraft,
+            nominal_state_func=self.nominal_state_func,
+            perturbations_func=self.perturbations_func,
+            position_velocity_func=self.position_velocity_func,
+            start_time=self.time.to(self.delta_t.unit).to_value(),
+            delta_t=self.delta_t.to_value(),
+            stop_time=(self.time + time)
+            .to(self.delta_t.unit)  # type: ignore
+            .to_value()
+            - 1,
+            verbose=False,
+        )
+        self.time += time << self.delta_t.unit  # type: ignore
+        self.q_actual = result["q_actual"][0]
 
     @classmethod
     def factory(cls):
@@ -169,11 +244,13 @@ def main():
 
     pos = []
     power = []
-    for i in tqdm(range(int(60 * 10))):
+    q = []
+    for i in tqdm(range(int(60 * 1))):
         crr_datetime = LAUNCH_DATE + timedelta(minutes=i)
         t = ts.utc(crr_datetime.year, crr_datetime.month, crr_datetime.day)
         satellite.propagate(1 << u.minute)  # type: ignore
         pos.append(satellite.orbit.r)
+        q.append(satellite.q_actual)
 
         earth_pos = earth.at(t)  # type: ignore
         sun_pos = sun.at(t)  # type: ignore
@@ -182,7 +259,9 @@ def main():
         v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
         v_sat_to_earth = -v_earth_to_sat
         v_sat_to_sun = sun_pos.position.to(u.km) - satellite.orbit.r
-        sat_direction = v_sat_to_earth  # satellite always pointing towards earth
+        sat_direction = adcssim.math_utils.quaternion_to_dcm(  # type: ignore
+            satellite.q_actual
+        )[0]
 
         orbit_sun_angle = np.arccos(
             np.dot(
@@ -194,16 +273,13 @@ def main():
             np.pi / 2 << u.rad
         )
 
-        if orbit_sun_angle >= shadow_angle_tresh:
+        if False and orbit_sun_angle >= shadow_angle_tresh:
             sun_view_factor = 0
         else:
-            sun_view_factor = max(
-                np.dot(
-                    sat_direction / np.linalg.norm(sat_direction),
-                    v_sat_to_sun / np.linalg.norm(v_sat_to_sun),
-                ).to_value(),
-                0,
-            )
+            sun_view_factor = np.dot(
+                sat_direction / np.linalg.norm(sat_direction),
+                v_sat_to_sun / np.linalg.norm(v_sat_to_sun),
+            ).to_value()
 
         power.append(
             SOLAR_IRRADIANCE
@@ -227,7 +303,14 @@ def main():
     #     color="green",
     #     s=200,
     # )
+
     plt.plot([p.to_value() for p in power])
+
+    # plt.plot([q_i[0] for q_i in q if abs(q_i[0])])
+    # plt.plot([q_i[1] for q_i in q if abs(q_i[1])])
+    # plt.plot([q_i[2] for q_i in q if abs(q_i[2])])
+    # plt.plot([q_i[3] for q_i in q if abs(q_i[3])])
+
     plt.show()
 
 
