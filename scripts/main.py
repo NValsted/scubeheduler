@@ -79,7 +79,7 @@ class Satellite:
     ):
         self.spacecraft = spacecraft
         self.orbit = orbit
-        self.time = 0 << u.s
+        self.time = 0 << u.minute  # type: ignore
 
         self.nominal_state_func = self.default_nominal_state_func
         self.perturbations_func = self.default_perturbations_func
@@ -182,7 +182,7 @@ class Satellite:
         w_0 = w_nominal + np.array([0.005, 0, 0])
 
         mass = 5.7 << u.kg  # type: ignore
-        dimensions = [10, 10, 10] << u.cm  # type: ignore
+        dimensions = [10, 10, 30] << u.cm  # type: ignore
         moment_of_inertia = (
             1
             / 12
@@ -234,6 +234,10 @@ class Satellite:
         return cls(spacecraft, sat_orbit)
 
 
+def dot_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+
 def main():
     satellite: Satellite = Satellite.factory()
 
@@ -257,29 +261,23 @@ def main():
 
         v_earth_to_sat = satellite.orbit.r
         v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
-        v_sat_to_earth = -v_earth_to_sat
         v_sat_to_sun = sun_pos.position.to(u.km) - satellite.orbit.r
         sat_direction = adcssim.math_utils.quaternion_to_dcm(  # type: ignore
             satellite.q_actual
-        )[0]
-
-        orbit_sun_angle = np.arccos(
-            np.dot(
-                v_earth_to_sat / np.linalg.norm(v_earth_to_sat),
-                v_earth_to_sun / np.linalg.norm(v_earth_to_sun),
-            )
-        )
-        shadow_angle_tresh = np.arctan(Earth.R / np.linalg.norm(v_earth_to_sat)) + (
-            np.pi / 2 << u.rad
         )
 
-        if False and orbit_sun_angle >= shadow_angle_tresh:
+        # TODO: iterate through each panel and calculate power contribution
+        sun_view_factor = dot_between(sat_direction[0], v_sat_to_sun)
+        if sun_view_factor < 0:
+            sun_view_factor = abs(sun_view_factor / 2)
+
+        shadow_thresh = ((np.pi / 2) << u.rad) - np.arccos(
+            1
+            - (np.linalg.norm(v_earth_to_sat) - Earth.R)
+            / np.linalg.norm(v_earth_to_sat)
+        )
+        if dot_between(v_earth_to_sat, -v_earth_to_sun) > np.cos(shadow_thresh):
             sun_view_factor = 0
-        else:
-            sun_view_factor = np.dot(
-                sat_direction / np.linalg.norm(sat_direction),
-                v_sat_to_sun / np.linalg.norm(v_sat_to_sun),
-            ).to_value()
 
         power.append(
             SOLAR_IRRADIANCE
