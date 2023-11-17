@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from functools import partial
+from typing import Any, Callable
 
 import numpy as np
 from astropy import units as u
@@ -29,32 +30,61 @@ SOLAR_CELL_EFFICIENCY = 0.293 << u.one  # type: ignore
 SOLAR_PANEL_AREA = (10**-4) * 10 * 3 * 4 << u.m**2  # type: ignore
 
 
+def dot_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+
+class WorldQuery:
+    ts: Any  # TODO : type
+    earth: Any  # TODO : type
+    sun: Any  # TODO : type
+    sat_orbit: Orbit
+    launch_time: datetime
+    current_time: datetime
+
+    def __init__(
+        self,
+        ts: Any = load.timescale(),
+        earth: Any = None,
+        sun: Any = None,
+        sat_orbit: Orbit = Orbit.from_classical(
+            Earth,
+            SEMI_MAJOR_AXIS,
+            ECCENTRICITY,
+            INCLINATION,
+            RIGHT_ASCENSION,
+            ARGUMENT_OF_PERIGEE,
+            INITIAL_ANOMALY,
+        ),
+        launch_time: datetime = LAUNCH_DATE,
+    ):
+        if earth is None or sun is None:
+            eph = load("de421.bsp")
+            earth, sun = eph["earth"], eph["sun"]
+        self.ts = ts
+        self.earth = earth
+        self.sun = sun
+        self.sat_orbit = sat_orbit
+        self.launch_time = launch_time
+        self.current_time = launch_time
+
+    def update_time(self, new_time: datetime):
+        self.sat_orbit = self.sat_orbit.propagate(
+            (new_time - self.current_time).seconds << u.s
+        )
+        self.current_time = new_time
+
+
 @dataclass
-class ActionResponse:
-    pass
-
-
-class Scheduler:
-    def __init__(self):
-        pass
-
-    def update(self, response: ActionResponse):
-        # measured power while executing action to dynamically update model?
-        # query fine sun sensor to get sun vector ?
-        # query attitude ?
-        pass
-
-    def get_plan(self):
-        pass
-
-
-class Battery:
-    pass
+class SolarPanel:
+    direction: np.ndarray
+    surface_area: u.Quantity
 
 
 class Satellite:
+    world_query: WorldQuery
     spacecraft: adcssim.spacecraft.Spacecraft  # type: ignore
-    orbit: Orbit
+    solar_panels: list[SolarPanel]
     time: u.Quantity
     delta_t: u.Quantity = 1 << u.minute  # type: ignore
     q_actual: np.ndarray
@@ -74,40 +104,36 @@ class Satellite:
 
     def __init__(
         self,
+        world_query: WorldQuery,
         spacecraft: adcssim.spacecraft.Spacecraft,  # type: ignore
-        orbit: Orbit,
+        solar_panels: list[SolarPanel],
     ):
         self.spacecraft = spacecraft
-        self.orbit = orbit
+        self.world_query = world_query
+        self.solar_panels = solar_panels
         self.time = 0 << u.minute  # type: ignore
 
-        self.nominal_state_func = self.default_nominal_state_func
+        self.nominal_state_func = partial(
+            self.default_nominal_state_func, satellite=self
+        )  # type: ignore
         self.perturbations_func = self.default_perturbations_func
         self.position_velocity_func = self.default_position_velocity_func
 
     @staticmethod
-    def default_nominal_state_func(
-        t: float,
-        w_nominal: np.ndarray = np.array([1, 0, 0]),
-        dcm_0_nominal: np.ndarray = np.eye(3),
-    ):
-        if w_nominal[0] != 0:
-            dcm_nominal = np.matmul(
-                adcssim.math_utils.t1_matrix(w_nominal[0] * t),  # type: ignore
-                dcm_0_nominal,
-            )
-        elif w_nominal[1] != 0:
-            dcm_nominal = np.matmul(
-                adcssim.math_utils.t2_matrix(w_nominal[1] * t),  # type: ignore
-                dcm_0_nominal,
-            )
-        elif w_nominal[2] != 0:
-            dcm_nominal = np.matmul(
-                adcssim.math_utils.t3_matrix(w_nominal[2] * t),  # type: ignore
-                dcm_0_nominal,
-            )
-        else:
-            dcm_nominal = dcm_0_nominal
+    def default_nominal_state_func(t: float, satellite: "Satellite"):
+        w_nominal = satellite.spacecraft.w
+        sky_field_t = satellite.world_query.ts.utc(
+            satellite.world_query.current_time.year,
+            satellite.world_query.current_time.month,
+            satellite.world_query.current_time.day,
+        )
+        dcm_nominal = [
+            satellite.world_query.sun.at(sky_field_t).position.to(u.km).to_value()
+            - satellite.world_query.sat_orbit.r.to(u.km).to_value(),
+            satellite.world_query.earth.at(sky_field_t).position.to(u.km).to_value()
+            - satellite.world_query.sat_orbit.r.to(u.km).to_value(),
+            satellite.world_query.sat_orbit.r.to(u.km).to_value(),
+        ]
         return dcm_nominal, w_nominal
 
     @staticmethod
@@ -120,10 +146,13 @@ class Satellite:
         )
 
     def default_position_velocity_func(self, t: float):
-        orbit_at_t = self.orbit.propagate(
+        orbit_at_t = self.world_query.sat_orbit.propagate(
             t - self.time.to(u.minute).to_value()  # type: ignore
         )
-        return orbit_at_t.r.to(u.km).to_value(), orbit_at_t.v.to(u.km / u.s).to_value()
+        return (
+            orbit_at_t.r.to(u.km).to_value(),
+            orbit_at_t.v.to(u.km / u.minute).to_value(),  # type: ignore
+        )
 
     def propagate(self, time: u.Quantity) -> None:
         assert time >= self.delta_t
@@ -144,18 +173,9 @@ class Satellite:
         self.q_actual = result["q_actual"][0]
 
     @classmethod
-    def factory(cls):
-        sat_orbit = Orbit.from_classical(
-            Earth,
-            SEMI_MAJOR_AXIS,
-            ECCENTRICITY,
-            INCLINATION,
-            RIGHT_ASCENSION,
-            ARGUMENT_OF_PERIGEE,
-            INITIAL_ANOMALY,
-        )
-        r_0 = np.array(sat_orbit.r.to(u.km))  # type: ignore
-        v_0 = np.array(sat_orbit.v.to(u.km / u.s))  # type: ignore
+    def factory(cls, world_query: WorldQuery):
+        r_0 = np.array(world_query.sat_orbit.r.to(u.km))  # type: ignore
+        v_0 = np.array(world_query.sat_orbit.v.to(u.km / u.minute))  # type: ignore
         b_x = -adcssim.math_utils.normalize(r_0)  # type: ignore
         b_y = adcssim.math_utils.normalize(v_0)  # type: ignore
         b_z = adcssim.math_utils.cross(b_x, b_y)  # type: ignore
@@ -167,7 +187,7 @@ class Satellite:
         w_nominal_i = (
             2
             * np.pi
-            / sat_orbit.period.to(u.s).to_value()  # type: ignore
+            / world_query.sat_orbit.period.to(u.minute).to_value()  # type: ignore
             * adcssim.math_utils.normalize(  # type: ignore
                 adcssim.math_utils.cross(r_0, v_0)  # type: ignore
             )
@@ -231,60 +251,106 @@ class Satellite:
             r=r_0,
             v=v_0,
         )
-        return cls(spacecraft, sat_orbit)
+
+        solar_panels = [
+            SolarPanel(
+                direction=np.array([1, 0, 0]),
+                surface_area=0.1 << u.m**2,  # type: ignore
+            )
+        ]
+        return cls(
+            world_query=world_query, spacecraft=spacecraft, solar_panels=solar_panels
+        )
 
 
-def dot_between(v1: np.ndarray, v2: np.ndarray) -> float:
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+@dataclass
+class SimStatsPoint:
+    time: datetime
+    power: u.Quantity
+
+
+class SimHandler:
+    satellite: Satellite
+    world_query: WorldQuery
+    launch_time: datetime
+    sim_stats: list[SimStatsPoint]
+
+    def __init__(
+        self,
+        satellite: Satellite,
+        world_query: WorldQuery,
+    ):
+        self.satellite = satellite
+        self.world_query = world_query
+        self.launch_time = world_query.launch_time
+        self.sim_stats = []
+
+    def calculate_power(self) -> u.Quantity:
+        sky_field_t = self.world_query.ts.utc(
+            self.world_query.current_time.year,
+            self.world_query.current_time.month,
+            self.world_query.current_time.day,
+        )
+
+        earth_pos = self.world_query.earth.at(sky_field_t)
+        sun_pos = self.world_query.sun.at(sky_field_t)
+
+        v_earth_to_sat = self.world_query.sat_orbit.r
+        v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
+        v_sat_to_sun = sun_pos.position.to(u.km) - self.world_query.sat_orbit.r
+        sat_direction = adcssim.math_utils.quaternion_to_dcm(  # type: ignore
+            self.satellite.q_actual
+        )
+
+        cum_power = 0 << u.W  # type: ignore
+        for panel in self.satellite.solar_panels:  # TODO: use panel detais
+            sun_view_factor = dot_between(sat_direction[0], v_sat_to_sun)
+            print(sun_view_factor)
+            if sun_view_factor < 0:
+                sun_view_factor = abs(sun_view_factor / 2)
+
+            shadow_thresh = ((np.pi / 2) << u.rad) - np.arccos(
+                1
+                - (np.linalg.norm(v_earth_to_sat) - Earth.R)
+                / np.linalg.norm(v_earth_to_sat)
+            )
+            if dot_between(v_earth_to_sat, -v_earth_to_sun) > np.cos(shadow_thresh):
+                sun_view_factor = 0
+
+            cum_power += (
+                SOLAR_IRRADIANCE
+                * SOLAR_CELL_EFFICIENCY
+                * SOLAR_PANEL_AREA
+                * sun_view_factor
+            )
+
+        return cum_power
+
+    def propagate(self, dt: u.Quantity) -> None:
+        self.world_query.update_time(
+            self.world_query.current_time
+            + timedelta(minutes=dt.to(u.minute).to_value())  # type: ignore
+        )
+        self.satellite.propagate(dt)
+
+        assert (
+            self.satellite.time.to(u.s).to_value()
+            == (self.world_query.current_time - self.launch_time).seconds
+        )
+
+        power = self.calculate_power()
+        self.sim_stats.append(
+            SimStatsPoint(time=self.world_query.current_time, power=power)
+        )
 
 
 def main():
-    satellite: Satellite = Satellite.factory()
+    world_query = WorldQuery()
+    satellite: Satellite = Satellite.factory(world_query=world_query)
+    sim_handler: SimHandler = SimHandler(satellite=satellite, world_query=world_query)
 
-    eph = load("de421.bsp")
-    earth, sun = eph["earth"], eph["sun"]
-
-    ts = load.timescale()
-
-    pos = []
-    power = []
-    q = []
-    for i in tqdm(range(int(60 * 1))):
-        crr_datetime = LAUNCH_DATE + timedelta(minutes=i)
-        t = ts.utc(crr_datetime.year, crr_datetime.month, crr_datetime.day)
-        satellite.propagate(1 << u.minute)  # type: ignore
-        pos.append(satellite.orbit.r)
-        q.append(satellite.q_actual)
-
-        earth_pos = earth.at(t)  # type: ignore
-        sun_pos = sun.at(t)  # type: ignore
-
-        v_earth_to_sat = satellite.orbit.r
-        v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
-        v_sat_to_sun = sun_pos.position.to(u.km) - satellite.orbit.r
-        sat_direction = adcssim.math_utils.quaternion_to_dcm(  # type: ignore
-            satellite.q_actual
-        )
-
-        # TODO: iterate through each panel and calculate power contribution
-        sun_view_factor = dot_between(sat_direction[0], v_sat_to_sun)
-        if sun_view_factor < 0:
-            sun_view_factor = abs(sun_view_factor / 2)
-
-        shadow_thresh = ((np.pi / 2) << u.rad) - np.arccos(
-            1
-            - (np.linalg.norm(v_earth_to_sat) - Earth.R)
-            / np.linalg.norm(v_earth_to_sat)
-        )
-        if dot_between(v_earth_to_sat, -v_earth_to_sun) > np.cos(shadow_thresh):
-            sun_view_factor = 0
-
-        power.append(
-            SOLAR_IRRADIANCE
-            * SOLAR_CELL_EFFICIENCY
-            * SOLAR_PANEL_AREA
-            * sun_view_factor
-        )
+    for _ in tqdm(range(int(20 * 1))):
+        sim_handler.propagate(1 << u.minute)  # type: ignore
 
     # fig = plt.figure()
     # ax = fig.add_subplot(projection="3d")
@@ -302,7 +368,7 @@ def main():
     #     s=200,
     # )
 
-    plt.plot([p.to_value() for p in power])
+    plt.plot([p.power.to_value() for p in sim_handler.sim_stats])
 
     # plt.plot([q_i[0] for q_i in q if abs(q_i[0])])
     # plt.plot([q_i[1] for q_i in q if abs(q_i[1])])
