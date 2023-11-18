@@ -16,7 +16,7 @@ from lib import adcssim
 LAUNCH_DATE = datetime(2024, 7, 1, tzinfo=timezone.utc)
 
 EARTH_MU = (3.986004418 * (10**14)) << (u.m**3 / u.s**2)  # type: ignore
-MEAN_MOTION = 15.09 << 1 / u.day  # type: ignore
+MEAN_MOTION = (15.09 * 2 * np.pi) << (1 / u.day)  # type: ignore
 
 SEMI_MAJOR_AXIS = (EARTH_MU / (MEAN_MOTION**2)) ** (1 / 3)
 ECCENTRICITY = 0.0 << u.one
