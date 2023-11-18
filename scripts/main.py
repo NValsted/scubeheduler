@@ -29,6 +29,8 @@ SOLAR_IRRADIANCE = 1361 << u.W / u.m**2  # type: ignore
 SOLAR_CELL_EFFICIENCY = 0.293 << u.one  # type: ignore
 SOLAR_PANEL_AREA = (10**-4) * 10 * 3 * 4 << u.m**2  # type: ignore
 
+ENABLE_ADCS_SIM = False
+
 
 def dot_between(v1: np.ndarray, v2: np.ndarray) -> float:
     return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
@@ -70,7 +72,7 @@ class WorldQuery:
 
     def update_time(self, new_time: datetime):
         self.sat_orbit = self.sat_orbit.propagate(
-            (new_time - self.current_time).seconds << u.s
+            (new_time - self.current_time).total_seconds() << u.s
         )
         self.current_time = new_time
 
@@ -156,21 +158,29 @@ class Satellite:
 
     def propagate(self, time: u.Quantity) -> None:
         assert time >= self.delta_t
-        result = adcssim.simulation.simulate_adcs(  # type: ignore
-            satellite=self.spacecraft,
-            nominal_state_func=self.nominal_state_func,
-            perturbations_func=self.perturbations_func,
-            position_velocity_func=self.position_velocity_func,
-            start_time=self.time.to(self.delta_t.unit).to_value(),
-            delta_t=self.delta_t.to_value(),
-            stop_time=(self.time + time)
-            .to(self.delta_t.unit)  # type: ignore
-            .to_value()
-            - 1,
-            verbose=False,
-        )
+        if ENABLE_ADCS_SIM:
+            result = adcssim.simulation.simulate_adcs(  # type: ignore
+                satellite=self.spacecraft,
+                nominal_state_func=self.nominal_state_func,
+                perturbations_func=self.perturbations_func,
+                position_velocity_func=self.position_velocity_func,
+                start_time=self.time.to(self.delta_t.unit).to_value(),
+                delta_t=self.delta_t.to_value(),
+                stop_time=(self.time + time)
+                .to(self.delta_t.unit)  # type: ignore
+                .to_value()
+                - 1,
+                verbose=False,
+            )
+            self.q_actual = result["q_actual"][0]
+        else:
+            dcm_nominal, _ = self.nominal_state_func(
+                self.time.to(self.delta_t.unit).to_value()  # type: ignore
+            )
+            self.q_actual = adcssim.math_utils.dcm_to_quaternion(  # type: ignore
+                np.array(dcm_nominal)
+            )
         self.time += time << self.delta_t.unit  # type: ignore
-        self.q_actual = result["q_actual"][0]
 
     @classmethod
     def factory(cls, world_query: WorldQuery):
@@ -305,7 +315,6 @@ class SimHandler:
         cum_power = 0 << u.W  # type: ignore
         for panel in self.satellite.solar_panels:  # TODO: use panel detais
             sun_view_factor = dot_between(sat_direction[0], v_sat_to_sun)
-            print(sun_view_factor)
             if sun_view_factor < 0:
                 sun_view_factor = abs(sun_view_factor / 2)
 
@@ -332,10 +341,9 @@ class SimHandler:
             + timedelta(minutes=dt.to(u.minute).to_value())  # type: ignore
         )
         self.satellite.propagate(dt)
-
         assert (
             self.satellite.time.to(u.s).to_value()
-            == (self.world_query.current_time - self.launch_time).seconds
+            == (self.world_query.current_time - self.launch_time).total_seconds()
         )
 
         power = self.calculate_power()
@@ -349,7 +357,7 @@ def main():
     satellite: Satellite = Satellite.factory(world_query=world_query)
     sim_handler: SimHandler = SimHandler(satellite=satellite, world_query=world_query)
 
-    for _ in tqdm(range(int(20 * 1))):
+    for _ in tqdm(range(int(60 * 24 * 2))):
         sim_handler.propagate(1 << u.minute)  # type: ignore
 
     # fig = plt.figure()
