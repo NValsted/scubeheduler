@@ -8,6 +8,7 @@ from astropy import units as u
 from matplotlib import pyplot as plt
 from poliastro.bodies import Earth
 from poliastro.twobody import Orbit
+from scipy.spatial.transform import Rotation
 from skyfield.api import load
 from tqdm import tqdm
 
@@ -264,9 +265,21 @@ class Satellite:
 
         solar_panels = [
             SolarPanel(
-                direction=np.array([1, 0, 0]),
-                surface_area=0.1 << u.m**2,  # type: ignore
-            )
+                direction=np.array([0, 0, 180]) << u.deg,
+                surface_area=8 * 30.18 << u.cm**2,  # type: ignore
+            ),
+            SolarPanel(
+                direction=np.array([0, 0, 90]) << u.deg,
+                surface_area=8 * 30.18 << u.cm**2,  # type: ignore
+            ),
+            SolarPanel(
+                direction=np.array([0, 0, 90 + 45]) << u.deg,
+                surface_area=16 * 30.18 << u.cm**2,  # type: ignore
+            ),
+            SolarPanel(
+                direction=np.array([0, 0, -45]) << u.deg,
+                surface_area=16 * 30.18 << u.cm**2,  # type: ignore
+            ),
         ]
         return cls(
             world_query=world_query, spacecraft=spacecraft, solar_panels=solar_panels
@@ -308,15 +321,15 @@ class SimHandler:
         v_earth_to_sat = self.world_query.sat_orbit.r
         v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
         v_sat_to_sun = sun_pos.position.to(u.km) - self.world_query.sat_orbit.r
-        sat_direction = adcssim.math_utils.quaternion_to_dcm(  # type: ignore
-            self.satellite.q_actual
-        )
+        sat_q = self.satellite.q_actual
 
         cum_power = 0 << u.W  # type: ignore
         for panel in self.satellite.solar_panels:  # TODO: use panel detais
-            sun_view_factor = dot_between(sat_direction[0], v_sat_to_sun)
-            if sun_view_factor < 0:
-                sun_view_factor = abs(sun_view_factor / 2)
+            panel_rotation = Rotation.from_quat(sat_q) * Rotation.from_rotvec(
+                panel.direction
+            )
+            panel_direction = (panel_rotation.as_matrix() * np.array([1, 0, 0]))[:, 0]
+            sun_view_factor = max(dot_between(panel_direction, v_sat_to_sun), 0)
 
             shadow_thresh = ((np.pi / 2) << u.rad) - np.arccos(
                 1
@@ -360,29 +373,7 @@ def main():
     for _ in tqdm(range(int(60 * 24 * 2))):
         sim_handler.propagate(1 << u.minute)  # type: ignore
 
-    # fig = plt.figure()
-    # ax = fig.add_subplot(projection="3d")
-    # ax.scatter(  # CubeSat
-    #     [p[0].to_value() for p in pos],
-    #     [p[1].to_value() for p in pos],
-    #     [p[2].to_value() for p in pos],
-    #     alpha=[p / len(pos) for p in range(len(pos))],
-    # )
-    # ax.scatter(  # Earth
-    #     [0],
-    #     [0],
-    #     [0],
-    #     color="green",
-    #     s=200,
-    # )
-
     plt.plot([p.power.to_value() for p in sim_handler.sim_stats])
-
-    # plt.plot([q_i[0] for q_i in q if abs(q_i[0])])
-    # plt.plot([q_i[1] for q_i in q if abs(q_i[1])])
-    # plt.plot([q_i[2] for q_i in q if abs(q_i[2])])
-    # plt.plot([q_i[3] for q_i in q if abs(q_i[3])])
-
     plt.show()
 
 
