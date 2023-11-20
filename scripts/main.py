@@ -81,6 +81,43 @@ class SolarPanel:
     surface_area: u.Quantity
 
 
+class Battery:
+    charge_level: u.Quantity
+    capacity: u.Quantity
+    efficiency: u.Quantity
+
+    class DischargeError(Exception):
+        pass
+
+    def __init__(
+        self,
+        capacity: u.Quantity,
+        efficiency: u.Quantity = 0.85 << u.one,  # type: ignore
+        charge_level: u.Quantity = 0 << u.W * u.h,  # type: ignore
+    ):
+        self.capacity = capacity
+        self.efficiency = efficiency
+        self.charge_level = charge_level
+
+    def charge(self, power: u.Quantity, time: u.Quantity):
+        self.charge_level = min(
+            power * self.efficiency * time + self.charge_level,  # type: ignore
+            self.capacity,  # type: ignore
+        )
+
+    def discharge(self, power: u.Quantity, time: u.Quantity):
+        discharge_energy = power / self.efficiency * time
+        if discharge_energy > self.charge_level:
+            raise Battery.DischargeError(
+                f"Not enough charge: {self.charge_level=}-{discharge_energy=}"
+            )
+
+        self.charge_level = max(
+            self.charge_level - discharge_energy,  # type: ignore
+            0 << u.Wh,  # type: ignore
+        )
+
+
 class AttitudeObjective(Enum):
     NADIR = "NADIR"
     SUN = "SUN"
@@ -89,16 +126,19 @@ class AttitudeObjective(Enum):
 class Satellite:
     world_query: WorldQuery
     solar_panels: list[SolarPanel]
+    battery: Battery
     attitude: Rotation
-    objective: AttitudeObjective = AttitudeObjective.SUN
+    objective: AttitudeObjective = AttitudeObjective.NADIR
 
     def __init__(
         self,
         world_query: WorldQuery,
         solar_panels: list[SolarPanel],
+        battery: Battery,
     ):
         self.world_query = world_query
         self.solar_panels = solar_panels
+        self.battery = battery
 
     def propagate(self, time: u.Quantity) -> None:
         if ENABLE_ADCS_SIM:
@@ -115,15 +155,13 @@ class Satellite:
             if self.objective == AttitudeObjective.SUN:
                 sat_to_sun = self.world_query.sun.at(sky_field_t).position.to(u.km) - (
                     self.world_query.sat_orbit.r
+                    + self.world_query.earth.at(sky_field_t).position.to(u.km)
                 )
                 sun_dir = sat_to_sun / np.linalg.norm(sat_to_sun)
                 x_dir = sun_dir
 
             elif self.objective == AttitudeObjective.NADIR:
-                sat_to_earth = (
-                    self.world_query.earth.at(sky_field_t).position.to(u.km)
-                    - self.world_query.sat_orbit.r
-                )
+                sat_to_earth = -self.world_query.sat_orbit.r
                 nadir = sat_to_earth / np.linalg.norm(sat_to_earth)
                 x_dir = -nadir
 
@@ -149,6 +187,7 @@ class Satellite:
 
     @classmethod
     def factory(cls, world_query: WorldQuery):
+        # Factory for DISCO-II reference mission
         solar_panels = [
             SolarPanel(
                 direction=np.array([1, 0, 0]),
@@ -167,7 +206,8 @@ class Satellite:
                 surface_area=16 * 30.18 << u.cm**2,  # type: ignore
             ),
         ]
-        return cls(world_query=world_query, solar_panels=solar_panels)
+        battery: Battery = Battery(capacity=92 << u.W * u.h)  # type: ignore
+        return cls(world_query=world_query, solar_panels=solar_panels, battery=battery)
 
 
 @dataclass
@@ -177,7 +217,31 @@ class SimStatsPoint:
     orbit_alignment: float
 
 
+@dataclass
+class Task:
+    priority: int
+    duration: u.Quantity
+    power: u.Quantity
+
+
+class Scheduler:
+    satellite: Satellite
+    world_query: WorldQuery
+
+    def __init__(
+        self,
+        satellite: Satellite,
+        world_query: WorldQuery,
+    ):
+        self.satellite = satellite
+        self.world_query = world_query
+
+    def update(self, time: u.Quantity) -> None:
+        pass
+
+
 class SimHandler:
+    scheduler: Scheduler
     satellite: Satellite
     world_query: WorldQuery
     launch_time: datetime
@@ -185,9 +249,11 @@ class SimHandler:
 
     def __init__(
         self,
+        scheduler: Scheduler,
         satellite: Satellite,
         world_query: WorldQuery,
     ):
+        self.scheduler = scheduler
         self.satellite = satellite
         self.world_query = world_query
         self.launch_time = world_query.launch_time
@@ -207,7 +273,9 @@ class SimHandler:
 
         v_earth_to_sat = self.world_query.sat_orbit.r
         v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
-        v_sat_to_sun = sun_pos.position.to(u.km) - self.world_query.sat_orbit.r
+        v_sat_to_sun = sun_pos.position.to(u.km) - (
+            self.world_query.sat_orbit.r + earth_pos.position.to(u.km)
+        )
 
         cum_power = 0 << u.W  # type: ignore
         for panel in self.satellite.solar_panels:
@@ -236,12 +304,13 @@ class SimHandler:
             + timedelta(minutes=dt.to(u.minute).to_value())  # type: ignore
         )
         self.satellite.propagate(dt)
-
-        power = self.calculate_power()
         orbit_alignment = np.dot(
             self.satellite.attitude.as_matrix()[:, 2],
             self.world_query.sat_orbit.v / np.linalg.norm(self.world_query.sat_orbit.v),
         )
+
+        power = self.calculate_power()
+        self.satellite.battery.charge(power, dt)
 
         self.sim_stats.append(
             SimStatsPoint(
@@ -255,9 +324,14 @@ class SimHandler:
 def main():
     world_query = WorldQuery()
     satellite: Satellite = Satellite.factory(world_query=world_query)
-    sim_handler: SimHandler = SimHandler(satellite=satellite, world_query=world_query)
+    scheduler: Scheduler = Scheduler(satellite=satellite, world_query=world_query)
+    sim_handler: SimHandler = SimHandler(
+        scheduler=scheduler,
+        satellite=satellite,
+        world_query=world_query,
+    )
 
-    for _ in tqdm(range(int(6 * 2 * 2))):
+    for _ in tqdm(range(int(60 * 2 * 2))):
         sim_handler.propagate(5 << u.minute)  # type: ignore
 
     plt.plot([p.power.to_value() for p in sim_handler.sim_stats])
