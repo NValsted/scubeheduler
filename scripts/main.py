@@ -77,6 +77,12 @@ class WorldQuery:
         )
         self.current_time = new_time
 
+    def get_earth_pos(self) -> np.ndarray:
+        return self.earth.at(self.ts.utc(self.current_time)).position.to(u.km)
+
+    def get_sun_pos(self) -> np.ndarray:
+        return self.sun.at(self.ts.utc(self.current_time)).position.to(u.km)
+
 
 @dataclass
 class SolarPanel:
@@ -147,18 +153,9 @@ class Satellite:
         if ENABLE_ADCS_SIM:
             raise NotImplementedError
         else:
-            sky_field_t = self.world_query.ts.utc(
-                self.world_query.current_time.year,
-                self.world_query.current_time.month,
-                self.world_query.current_time.day,
-                self.world_query.current_time.hour,
-                self.world_query.current_time.minute,
-            )
-
             if self.objective == AttitudeObjective.SUN:
-                sat_to_sun = self.world_query.sun.at(sky_field_t).position.to(u.km) - (
-                    self.world_query.sat_orbit.r
-                    + self.world_query.earth.at(sky_field_t).position.to(u.km)
+                sat_to_sun = self.world_query.get_sun_pos() - (
+                    self.world_query.sat_orbit.r + self.world_query.get_earth_pos()
                 )
                 sun_dir = sat_to_sun / np.linalg.norm(sat_to_sun)
                 x_dir = sun_dir
@@ -353,6 +350,16 @@ class Scheduler:
         self.running_tasks.append(self.pending_tasks.pop(idx))
         return True
 
+    def _exec_strategy(self) -> int:
+        """
+        Function responsible for actual task scheduling strategy.
+        """
+        _new_launched_tasks = 0
+        for i in range(len(self.pending_tasks)):
+            if self._attempt_task(i - _new_launched_tasks):
+                _new_launched_tasks += 1
+        return _new_launched_tasks
+
     def propagate(self, time: u.Quantity) -> tuple[int, int]:
         _new_finished_tasks = 0
         for i in range(len(self.running_tasks)):
@@ -367,10 +374,7 @@ class Scheduler:
                 self.finished_tasks.add(self.running_tasks.pop(idx))
                 _new_finished_tasks += 1
 
-        _new_launched_tasks = 0
-        for i in range(len(self.pending_tasks)):
-            if self._attempt_task(i - _new_launched_tasks):
-                _new_launched_tasks += 1
+        _new_launched_tasks = self._exec_strategy()
 
         return _new_finished_tasks, _new_launched_tasks
 
@@ -395,25 +399,16 @@ class SimHandler:
         self.sim_stats = []
 
     def add_task_batch(self, task_batch: list[Task]) -> None:
-        self.scheduler.pending_tasks.extend(task_batch)
+        for task in task_batch:
+            self.scheduler.add_task(task)
 
     def calculate_power_generation(self) -> list[u.Quantity]:
-        sky_field_t = self.world_query.ts.utc(
-            self.world_query.current_time.year,
-            self.world_query.current_time.month,
-            self.world_query.current_time.day,
-            self.world_query.current_time.hour,
-            self.world_query.current_time.minute,
-        )
-
-        earth_pos = self.world_query.earth.at(sky_field_t)
-        sun_pos = self.world_query.sun.at(sky_field_t)
+        earth_pos = self.world_query.get_earth_pos()
+        sun_pos = self.world_query.get_sun_pos()
 
         v_earth_to_sat = self.world_query.sat_orbit.r
-        v_earth_to_sun = sun_pos.position.to(u.km) - earth_pos.position.to(u.km)
-        v_sat_to_sun = sun_pos.position.to(u.km) - (
-            self.world_query.sat_orbit.r + earth_pos.position.to(u.km)
-        )
+        v_earth_to_sun = sun_pos - earth_pos
+        v_sat_to_sun = sun_pos - (self.world_query.sat_orbit.r + earth_pos)
 
         cum_power = []
         for panel in self.satellite.solar_panels:
@@ -485,7 +480,12 @@ def main():
 
     RUN_TIME = 60 * 24 * 2
     for i in tqdm(range(int(RUN_TIME))):
-        sim_handler.propagate(1 << u.minute)  # type: ignore
+        try:
+            sim_handler.propagate(1 << u.minute)  # type: ignore
+        except Battery.DischargeError:
+            print("Battery discharged more than allowed. Stopping simulation.")
+            break
+
         if i % (RUN_TIME // 100 + 1) == 0:
             sim_handler.add_task_batch(task_batches[i // (RUN_TIME // 100 + 1)])  # type: ignore
 
