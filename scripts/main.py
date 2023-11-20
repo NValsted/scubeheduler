@@ -1,7 +1,10 @@
+from csv import DictWriter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from astropy import units as u
@@ -213,8 +216,51 @@ class Satellite:
 @dataclass
 class SimStatsPoint:
     time: datetime
-    power: u.Quantity
     orbit_alignment: float
+    attitude: Rotation
+    battery_charge: u.Quantity
+    power_generation: list[u.Quantity]
+    power_drain: list[u.Quantity]
+    pending_tasks: int
+    running_tasks: int
+    finished_tasks: int
+    task_priority_penalty: int
+
+    @staticmethod
+    def serialize_as_csv(
+        rows: list["SimStatsPoint"],
+        file_path: Path = Path("data")
+        / f"sim-results-{datetime.now().date().isoformat()}-{uuid4()}.csv",
+    ) -> None:
+        with file_path.open("w") as f:
+            writer = DictWriter(f, fieldnames=SimStatsPoint.__dataclass_fields__.keys())
+            writer.writeheader()
+            writer.writerows(
+                [
+                    {
+                        k: v.to_value() if isinstance(v, u.Quantity) else v
+                        for k, v in {
+                            "time": row.time.isoformat(),
+                            "orbit_alignment": row.orbit_alignment,
+                            "attitude": row.attitude.as_quat().tolist(),  # type: ignore
+                            "battery_charge": row.battery_charge.to(
+                                u.W * u.h  # type: ignore
+                            ).to_value(),
+                            "power_generation": [
+                                q.to(u.W).to_value() for q in row.power_generation
+                            ],
+                            "power_drain": [
+                                q.to(u.W).to_value() for q in row.power_drain
+                            ],
+                            "pending_tasks": row.pending_tasks,
+                            "running_tasks": row.running_tasks,
+                            "finished_tasks": row.finished_tasks,
+                            "task_priority_penalty": row.task_priority_penalty,
+                        }.items()
+                    }
+                    for row in rows
+                ]
+            )
 
 
 @dataclass
@@ -226,6 +272,14 @@ class Task:
     duration: u.Quantity
     power: u.Quantity
     dependencies: list[int]
+
+    def __hash__(self) -> int:
+        return self.task_id
+
+    def __eq__(self, __value: object) -> bool:
+        if not isinstance(__value, Task):
+            return False
+        return self.task_id == __value.task_id
 
     @classmethod
     def random(cls):
@@ -255,6 +309,7 @@ class Scheduler:
     pending_tasks: list[Task]
     running_tasks: list[Task]
     finished_tasks: set[Task]
+    task_priority_penalty: int
     _current_energy_demand: u.Quantity
 
     def __init__(
@@ -265,15 +320,17 @@ class Scheduler:
         self.satellite = satellite
         self.world_query = world_query
         self.pending_tasks = []
+        self.running_tasks = []
+        self.finished_tasks = set()
+        self.task_priority_penalty = 0
         self._current_energy_demand = 0 << u.W * u.h  # type: ignore
-        self._finished_tasks = set()
 
     def add_task(self, task: Task) -> None:
         self.pending_tasks.append(task)
 
     def _attempt_task(self, idx: int) -> bool:
         if not all(
-            dep in self._finished_tasks for dep in self.pending_tasks[idx].dependencies
+            dep in self.finished_tasks for dep in self.pending_tasks[idx].dependencies
         ):  # dependency not met
             return False
 
@@ -283,25 +340,39 @@ class Scheduler:
         ):  # not enough energy
             return False
 
+        # Add number of higher priority pending tasks to penalty
+        self.task_priority_penalty += sum(
+            1
+            for task in self.pending_tasks
+            if task.priority > self.pending_tasks[idx].priority
+        )
+
         self._current_energy_demand += (  # type: ignore
             self.pending_tasks[idx].power * self.pending_tasks[idx].duration
         )
         self.running_tasks.append(self.pending_tasks.pop(idx))
         return True
 
-    def propagate(self, time: u.Quantity) -> None:
+    def propagate(self, time: u.Quantity) -> tuple[int, int]:
+        _new_finished_tasks = 0
         for i in range(len(self.running_tasks)):
-            time_decrement = min(self.running_tasks[i].duration, time)  # type: ignore
-            self.running_tasks[i].duration -= time_decrement
+            idx = i - _new_finished_tasks
+            time_decrement = min(self.running_tasks[idx].duration, time)  # type: ignore
+            self.running_tasks[idx].duration -= time_decrement
             self._current_energy_demand -= (
-                self.running_tasks[i].power * time_decrement  # type: ignore
+                self.running_tasks[idx].power * time_decrement  # type: ignore
             )
 
-            if self.running_tasks[i].duration <= 1e-15 << u.minute:  # type: ignore
-                self._finished_tasks.add(self.running_tasks.pop(i))
+            if self.running_tasks[idx].duration <= 1e-15 << u.minute:  # type: ignore
+                self.finished_tasks.add(self.running_tasks.pop(idx))
+                _new_finished_tasks += 1
 
+        _new_launched_tasks = 0
         for i in range(len(self.pending_tasks)):
-            self._attempt_task(i)
+            if self._attempt_task(i - _new_launched_tasks):
+                _new_launched_tasks += 1
+
+        return _new_finished_tasks, _new_launched_tasks
 
 
 class SimHandler:
@@ -323,7 +394,10 @@ class SimHandler:
         self.launch_time = world_query.launch_time
         self.sim_stats = []
 
-    def calculate_power(self) -> u.Quantity:
+    def add_task_batch(self, task_batch: list[Task]) -> None:
+        self.scheduler.pending_tasks.extend(task_batch)
+
+    def calculate_power_generation(self) -> list[u.Quantity]:
         sky_field_t = self.world_query.ts.utc(
             self.world_query.current_time.year,
             self.world_query.current_time.month,
@@ -341,7 +415,7 @@ class SimHandler:
             self.world_query.sat_orbit.r + earth_pos.position.to(u.km)
         )
 
-        cum_power = 0 << u.W  # type: ignore
+        cum_power = []
         for panel in self.satellite.solar_panels:
             panel_direction = self.satellite.attitude.apply(panel.direction)
             sun_view_factor = max(dot_between(panel_direction, v_sat_to_sun), 0)
@@ -353,7 +427,7 @@ class SimHandler:
             if dot_between(v_earth_to_sat, -v_earth_to_sun) > np.cos(shadow_thresh):
                 sun_view_factor = 0
 
-            cum_power += (
+            cum_power.append(
                 SOLAR_IRRADIANCE
                 * SOLAR_CELL_EFFICIENCY
                 * panel.surface_area
@@ -373,16 +447,23 @@ class SimHandler:
             self.world_query.sat_orbit.v / np.linalg.norm(self.world_query.sat_orbit.v),
         )
 
-        power = self.calculate_power()
-        self.satellite.battery.charge(power, dt)
+        power_generation = self.calculate_power_generation()
+        self.satellite.battery.charge(sum(power_generation, start=0 << u.W), dt)  # type: ignore
 
         self.scheduler.propagate(dt)
 
         self.sim_stats.append(
             SimStatsPoint(
                 time=self.world_query.current_time,
-                power=power,
                 orbit_alignment=orbit_alignment,
+                attitude=self.satellite.attitude,
+                battery_charge=self.satellite.battery.charge_level,
+                power_generation=power_generation,
+                power_drain=[t.power for t in self.scheduler.running_tasks],
+                pending_tasks=len(self.scheduler.pending_tasks),
+                running_tasks=len(self.scheduler.running_tasks),
+                finished_tasks=len(self.scheduler.finished_tasks),
+                task_priority_penalty=self.scheduler.task_priority_penalty,
             )
         )
 
@@ -391,17 +472,27 @@ def main():
     world_query = WorldQuery()
     satellite: Satellite = Satellite.factory(world_query=world_query)
     scheduler: Scheduler = Scheduler(satellite=satellite, world_query=world_query)
+
+    np.random.seed(0)
+    tasks = [Task.random() for _ in range(1000)]
+    task_batches = np.array_split(np.array(tasks), 100)
+
     sim_handler: SimHandler = SimHandler(
         scheduler=scheduler,
         satellite=satellite,
         world_query=world_query,
     )
 
-    for _ in tqdm(range(int(60 * 2 * 2))):
-        sim_handler.propagate(5 << u.minute)  # type: ignore
+    RUN_TIME = 60 * 24 * 2
+    for i in tqdm(range(int(RUN_TIME))):
+        sim_handler.propagate(1 << u.minute)  # type: ignore
+        if i % (RUN_TIME // 100 + 1) == 0:
+            sim_handler.add_task_batch(task_batches[i // (RUN_TIME // 100 + 1)])  # type: ignore
 
-    plt.plot([p.power.to_value() for p in sim_handler.sim_stats])
-    # plt.plot([eh.orbit_alignment for eh in sim_handler.sim_stats])
+    SimStatsPoint.serialize_as_csv(sim_handler.sim_stats)
+
+    plt.plot([sum(p.power_generation, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore
+    plt.plot([sum(p.power_drain, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore
     plt.show()
 
 
