@@ -119,7 +119,7 @@ class Battery:
 
 
 class AttitudeObjective(Enum):
-    NADIR = "NADIR"
+    EARTH = "EARTH"
     SUN = "SUN"
 
 
@@ -128,7 +128,7 @@ class Satellite:
     solar_panels: list[SolarPanel]
     battery: Battery
     attitude: Rotation
-    objective: AttitudeObjective = AttitudeObjective.NADIR
+    objective: AttitudeObjective = AttitudeObjective.EARTH
 
     def __init__(
         self,
@@ -160,7 +160,7 @@ class Satellite:
                 sun_dir = sat_to_sun / np.linalg.norm(sat_to_sun)
                 x_dir = sun_dir
 
-            elif self.objective == AttitudeObjective.NADIR:
+            elif self.objective == AttitudeObjective.EARTH:
                 sat_to_earth = -self.world_query.sat_orbit.r
                 nadir = sat_to_earth / np.linalg.norm(sat_to_earth)
                 x_dir = -nadir
@@ -219,14 +219,43 @@ class SimStatsPoint:
 
 @dataclass
 class Task:
+    _TASKS = []
+
+    task_id: int
     priority: int
     duration: u.Quantity
     power: u.Quantity
+    dependencies: list[int]
+
+    @classmethod
+    def random(cls):
+        task_id = np.random.randint(0, 1000)
+        dependencies = (
+            np.random.choice(
+                Task._TASKS,
+                size=np.random.randint(0, min(10, len(Task._TASKS))),
+                replace=False,
+            )
+            if len(Task._TASKS) > 0
+            else []
+        )
+        Task._TASKS.append(task_id)
+        return cls(
+            task_id=task_id,
+            priority=np.random.randint(0, 100),
+            duration=np.random.randint(0, 50) << u.minute,  # type: ignore
+            power=np.random.randint(0, 100) << u.W,  # type: ignore
+            dependencies=dependencies,
+        )
 
 
 class Scheduler:
     satellite: Satellite
     world_query: WorldQuery
+    pending_tasks: list[Task]
+    running_tasks: list[Task]
+    finished_tasks: set[Task]
+    _current_energy_demand: u.Quantity
 
     def __init__(
         self,
@@ -235,9 +264,44 @@ class Scheduler:
     ):
         self.satellite = satellite
         self.world_query = world_query
+        self.pending_tasks = []
+        self._current_energy_demand = 0 << u.W * u.h  # type: ignore
+        self._finished_tasks = set()
 
-    def update(self, time: u.Quantity) -> None:
-        pass
+    def add_task(self, task: Task) -> None:
+        self.pending_tasks.append(task)
+
+    def _attempt_task(self, idx: int) -> bool:
+        if not all(
+            dep in self._finished_tasks for dep in self.pending_tasks[idx].dependencies
+        ):  # dependency not met
+            return False
+
+        if self.satellite.battery.charge_level < (
+            self.pending_tasks[idx].power * self.pending_tasks[idx].duration
+            + self._current_energy_demand
+        ):  # not enough energy
+            return False
+
+        self._current_energy_demand += (  # type: ignore
+            self.pending_tasks[idx].power * self.pending_tasks[idx].duration
+        )
+        self.running_tasks.append(self.pending_tasks.pop(idx))
+        return True
+
+    def propagate(self, time: u.Quantity) -> None:
+        for i in range(len(self.running_tasks)):
+            time_decrement = min(self.running_tasks[i].duration, time)  # type: ignore
+            self.running_tasks[i].duration -= time_decrement
+            self._current_energy_demand -= (
+                self.running_tasks[i].power * time_decrement  # type: ignore
+            )
+
+            if self.running_tasks[i].duration <= 1e-15 << u.minute:  # type: ignore
+                self._finished_tasks.add(self.running_tasks.pop(i))
+
+        for i in range(len(self.pending_tasks)):
+            self._attempt_task(i)
 
 
 class SimHandler:
@@ -311,6 +375,8 @@ class SimHandler:
 
         power = self.calculate_power()
         self.satellite.battery.charge(power, dt)
+
+        self.scheduler.propagate(dt)
 
         self.sim_stats.append(
             SimStatsPoint(
