@@ -12,10 +12,10 @@ from matplotlib import pyplot as plt
 from poliastro.bodies import Earth
 from poliastro.twobody import Orbit
 from scipy.spatial.transform import Rotation
-from skyfield.api import load
+from skyfield.api import load, wgs84
 from tqdm import tqdm
 
-LAUNCH_DATE = datetime(2024, 7, 1, tzinfo=timezone.utc)
+LAUNCH_DATE = datetime(2024, 7, 31, tzinfo=timezone.utc)
 
 EARTH_MU = (3.986004418 * (10**14)) << (u.m**3 / u.s**2)  # type: ignore
 MEAN_MOTION = (15.09 * 2 * np.pi) << (1 / u.day)  # type: ignore
@@ -29,6 +29,9 @@ INITIAL_ANOMALY = -90.0 << u.deg  # type: ignore
 
 SOLAR_IRRADIANCE = 1361 << u.W / u.m**2  # type: ignore
 SOLAR_CELL_EFFICIENCY = 0.293 << u.one  # type: ignore
+
+AARHUS_LAT = 56.156247
+AARHUS_LON = 10.2013151
 
 ENABLE_ADCS_SIM = False
 
@@ -123,7 +126,7 @@ class Battery:
 
         self.charge_level = max(
             self.charge_level - discharge_energy,  # type: ignore
-            0 << u.Wh,  # type: ignore
+            0 << u.W * u.h,  # type: ignore
         )
 
 
@@ -370,6 +373,10 @@ class Scheduler:
                 self.running_tasks[idx].power * time_decrement  # type: ignore
             )
 
+            self.satellite.battery.discharge(
+                self.running_tasks[idx].power, time_decrement  # type: ignore
+            )
+
             if self.running_tasks[idx].duration <= 1e-15 << u.minute:  # type: ignore
                 self.finished_tasks.add(self.running_tasks.pop(idx))
                 _new_finished_tasks += 1
@@ -493,6 +500,9 @@ def main():
 
     plt.plot([sum(p.power_generation, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore
     plt.plot([sum(p.power_drain, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore
+    plt.plot([p.battery_charge.to(u.W * u.h).to_value() for p in sim_handler.sim_stats])  # type: ignore
+    plt.legend(["Power generation", "Power drain", "Battery charge"])
+    plt.xlabel("Time [min]")
     plt.show()
 
 
