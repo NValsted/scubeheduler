@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
@@ -16,6 +16,7 @@ from skyfield.api import load, wgs84
 from tqdm import tqdm
 
 LAUNCH_DATE = datetime(2024, 7, 31, tzinfo=timezone.utc)
+SIM_SPEED_MULTIPLIER = 1
 
 EARTH_MU = (3.986004418 * (10**14)) << (u.m**3 / u.s**2)  # type: ignore
 MEAN_MOTION = (15.09 * 2 * np.pi) << (1 / u.day)  # type: ignore
@@ -47,9 +48,12 @@ class WorldQuery:
     sat_orbit: Orbit
     launch_time: datetime
     current_time: datetime
+    earth_POIs: dict[str, Any]
+    _memo: dict[str, Any]
 
     def __init__(
         self,
+        earth_POIs: Optional[dict[str, tuple[float, float]]] = None,
         ts: Any = load.timescale(),
         earth: Any = None,
         sun: Any = None,
@@ -73,18 +77,42 @@ class WorldQuery:
         self.sat_orbit = sat_orbit
         self.launch_time = launch_time
         self.current_time = launch_time
+        self._memo = {}
+
+        if earth_POIs is None:
+            earth_POIs = {}
+        self.earth_POIs = {}
+        for k, v in earth_POIs.items():
+            self.earth_POIs[k] = self.earth + wgs84.latlon(*v, elevation_m=0)
 
     def update_time(self, new_time: datetime):
+        self._memo = {}
         self.sat_orbit = self.sat_orbit.propagate(
             (new_time - self.current_time).total_seconds() << u.s
         )
         self.current_time = new_time
 
+    def skyfield_time(self) -> Any:
+        return self.ts.utc(self.current_time)
+
     def get_earth_pos(self) -> np.ndarray:
-        return self.earth.at(self.ts.utc(self.current_time)).position.to(u.km)
+        if "earth_pos" not in self._memo:
+            self._memo["earth_pos"] = self.earth.at(self.skyfield_time()).position.to(
+                u.km
+            )
+        return self._memo["earth_pos"]
 
     def get_sun_pos(self) -> np.ndarray:
-        return self.sun.at(self.ts.utc(self.current_time)).position.to(u.km)
+        if "sun_pos" not in self._memo:
+            self._memo["sun_pos"] = self.sun.at(self.skyfield_time()).position.to(u.km)
+        return self._memo["sun_pos"]
+
+    def get_earth_POI_pos(self, earth_POI: str) -> np.ndarray:
+        if earth_POI not in self._memo:
+            self._memo[earth_POI] = (
+                self.earth_POIs[earth_POI].at(self.skyfield_time()).position.to(u.km)
+            )
+        return self._memo[earth_POI]
 
 
 @dataclass
@@ -269,6 +297,8 @@ class Task:
 
     task_id: int
     priority: int
+    # expiration: timedelta
+    # target_POI: Optional[str]
     duration: u.Quantity
     power: u.Quantity
     dependencies: list[int]
@@ -297,6 +327,8 @@ class Task:
         return cls(
             task_id=task_id,
             priority=np.random.randint(0, 100),
+            # expiration=timedelta(minutes=np.random.randint(0, 50)),
+            # target_POI=None,
             duration=np.random.randint(0, 50) << u.minute,  # type: ignore
             power=np.random.randint(0, 100) << u.W,  # type: ignore
             dependencies=dependencies,
@@ -471,7 +503,9 @@ class SimHandler:
 
 
 def main():
-    world_query = WorldQuery()
+    world_query: WorldQuery = WorldQuery(
+        earth_POIs={"AARHUS": (AARHUS_LAT, AARHUS_LON)}
+    )
     satellite: Satellite = Satellite.factory(world_query=world_query)
     scheduler: Scheduler = Scheduler(satellite=satellite, world_query=world_query)
 
@@ -485,16 +519,24 @@ def main():
         world_query=world_query,
     )
 
-    RUN_TIME = 60 * 24 * 2
+    RUN_TIME = 60 * 24 * 2 // SIM_SPEED_MULTIPLIER
+
     for i in tqdm(range(int(RUN_TIME))):
         try:
-            sim_handler.propagate(1 << u.minute)  # type: ignore
+            sim_handler.propagate(1 * SIM_SPEED_MULTIPLIER << u.minute)  # type: ignore
         except Battery.DischargeError:
             print("Battery discharged more than allowed. Stopping simulation.")
             break
 
         if i % (RUN_TIME // 100 + 1) == 0:
             sim_handler.add_task_batch(task_batches[i // (RUN_TIME // 100 + 1)])  # type: ignore
+
+        v_earth_to_poi = (
+            world_query.get_earth_POI_pos("AARHUS") - world_query.get_earth_pos()
+        )
+        v_earth_to_sat = world_query.sat_orbit.r
+        v_poi_to_sat = v_earth_to_sat - v_earth_to_poi
+        poi_view_angle = dot_between(v_poi_to_sat, v_earth_to_poi)
 
     SimStatsPoint.serialize_as_csv(sim_handler.sim_stats)
 
