@@ -69,7 +69,7 @@ class WorldQuery:
         launch_time: datetime = LAUNCH_DATE,
     ):
         if earth is None or sun is None:
-            eph = load("de421.bsp")
+            eph = load("de440.bsp")
             earth, sun = eph["earth"], eph["sun"]
         self.ts = ts
         self.earth = earth
@@ -482,7 +482,7 @@ class SimHandler:
         )
 
         power_generation = self.calculate_power_generation()
-        self.satellite.battery.charge(sum(power_generation, start=0 << u.W), dt)  # type: ignore
+        self.satellite.battery.charge(sum(power_generation, start=0 << u.W), dt)  # type: ignore  # NOQA: E501
 
         self.scheduler.propagate(dt)
 
@@ -504,7 +504,7 @@ class SimHandler:
 
 def main():
     world_query: WorldQuery = WorldQuery(
-        earth_POIs={"AARHUS": (AARHUS_LAT, AARHUS_LON)}
+        earth_POIs={"AARHUS": (AARHUS_LAT, AARHUS_LON)},
     )
     satellite: Satellite = Satellite.factory(world_query=world_query)
     scheduler: Scheduler = Scheduler(satellite=satellite, world_query=world_query)
@@ -519,7 +519,7 @@ def main():
         world_query=world_query,
     )
 
-    RUN_TIME = 60 * 24 * 2 // SIM_SPEED_MULTIPLIER
+    RUN_TIME = (60 * 24 * 2) // SIM_SPEED_MULTIPLIER
 
     for i in tqdm(range(int(RUN_TIME))):
         try:
@@ -529,20 +529,21 @@ def main():
             break
 
         if i % (RUN_TIME // 100 + 1) == 0:
-            sim_handler.add_task_batch(task_batches[i // (RUN_TIME // 100 + 1)])  # type: ignore
+            sim_handler.add_task_batch(task_batches[i // (RUN_TIME // 100 + 1)])  # type: ignore  # NOQA: E501
 
+        v_earth_to_sat = world_query.sat_orbit.r
         v_earth_to_poi = (
             world_query.get_earth_POI_pos("AARHUS") - world_query.get_earth_pos()
         )
-        v_earth_to_sat = world_query.sat_orbit.r
+
         v_poi_to_sat = v_earth_to_sat - v_earth_to_poi
-        poi_view_angle = dot_between(v_poi_to_sat, v_earth_to_poi)
+        poi_view_angle = dot_between(v_poi_to_sat, v_earth_to_poi)  # NOQA: F841
 
     SimStatsPoint.serialize_as_csv(sim_handler.sim_stats)
 
-    plt.plot([sum(p.power_generation, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore
-    plt.plot([sum(p.power_drain, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore
-    plt.plot([p.battery_charge.to(u.W * u.h).to_value() for p in sim_handler.sim_stats])  # type: ignore
+    plt.plot([sum(p.power_generation, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore  # NOQA: E501
+    plt.plot([sum(p.power_drain, start=0 << u.W).to_value() for p in sim_handler.sim_stats])  # type: ignore  # NOQA: E501
+    plt.plot([p.battery_charge.to(u.W * u.h).to_value() for p in sim_handler.sim_stats])  # type: ignore  # NOQA: E501
     plt.legend(["Power generation", "Power drain", "Battery charge"])
     plt.xlabel("Time [min]")
     plt.show()
